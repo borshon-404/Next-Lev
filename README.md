@@ -175,9 +175,9 @@ Tests run against an **isolated database** (`nexlev_test` by default; override w
 | --- | --- |
 | GitHub repo | `github.com/borshon-404/Next-Lev` (branch `main`, auto-deploys to production) |
 | Vercel project | `next-lev` (team `borshon-404`) |
-| Production URL | **https://nexlev-app.vercel.app** |
+| Production URL | **https://next-lev.vercel.app** (canonical; `https://nexlev-app.vercel.app` 308-redirects here) |
 | Database | Neon Postgres (Vercel Marketplace integration `neon`, region `iad1`), store `nexlev-db-iad1`. Migrations are applied to the DB directly (see below), so the Vercel build command stays `npm run build` |
-| Env vars on Vercel | `DATABASE_URL` + Neon companion vars (injected by the integration), `AUTH_SECRET`, `AUTH_URL=https://nexlev-app.vercel.app`, `STORAGE_DRIVER=local` |
+| Env vars on Vercel | `DATABASE_URL` + Neon companion vars (injected by the integration), `AUTH_SECRET`, `AUTH_URL=https://next-lev.vercel.app`, `STORAGE_DRIVER=local` |
 
 **Applying migrations & reseeding:** from a machine that can reach the DB,
 `npx vercel env pull .env.prod --environment production`, then
