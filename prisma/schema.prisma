@@ -1,0 +1,646 @@
+// ============================================================================
+// Nexlev — MLM Management Platform
+// Prisma schema (PostgreSQL)
+//
+// Design notes:
+//  - Financial data is modeled as an immutable ledger (WalletLedger). Balances
+//    on Wallet are cached aggregates; every change MUST create a ledger row.
+//  - Genealogy uses sponsorId + a materialized `path` for fast subtree queries
+//    ("LIKE 'prefix%'") alongside `depth` for level math.
+//  - Idempotency: Commission is unique per (sourceTransaction, beneficiary);
+//    WalletLedger carries an optional unique idempotencyKey.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------------------------------
+// Enums
+// ----------------------------------------------------------------------------
+
+enum Role {
+  ADMIN
+  MEMBER
+}
+
+enum UserStatus {
+  ACTIVE
+  PENDING
+  INACTIVE
+  SUSPENDED
+}
+
+enum KycStatus {
+  NOT_SUBMITTED
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum CommissionStatus {
+  PENDING
+  APPROVED
+  PAID
+  CANCELLED
+  REVERSED
+}
+
+enum TransactionType {
+  PACKAGE_PURCHASE
+  DEPOSIT
+  WITHDRAWAL
+  COMMISSION_PAYOUT
+  REFUND
+  ADJUSTMENT
+}
+
+enum TransactionStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  REVERSED
+}
+
+/// Wallet ledger entry types (each row changes exactly one balance bucket).
+enum LedgerType {
+  COMMISSION
+  BONUS
+  DEPOSIT
+  WITHDRAWAL
+  WITHDRAWAL_FEE
+  REFUND
+  REVERSAL
+  ADJUSTMENT
+}
+
+/// Which wallet bucket a ledger row applies to.
+enum BalanceType {
+  AVAILABLE
+  PENDING
+}
+
+enum WithdrawalStatus {
+  PENDING
+  APPROVED
+  PROCESSING
+  COMPLETED
+  REJECTED
+  CANCELLED
+}
+
+enum DepositStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  CANCELLED
+  REFUNDED
+}
+
+enum PurchaseStatus {
+  PENDING
+  COMPLETED
+  CANCELLED
+  REFUNDED
+}
+
+enum NotificationType {
+  NEW_REFERRAL
+  COMMISSION_RECEIVED
+  WITHDRAWAL_SUBMITTED
+  WITHDRAWAL_APPROVED
+  WITHDRAWAL_REJECTED
+  KYC_APPROVED
+  KYC_REJECTED
+  PACKAGE_PURCHASED
+  RANK_ACHIEVED
+  ANNOUNCEMENT
+}
+
+// ----------------------------------------------------------------------------
+// Identity & authentication (Auth.js compatible)
+// ----------------------------------------------------------------------------
+
+model User {
+  id            String     @id @default(cuid())
+  name          String
+  email         String     @unique
+  emailVerified DateTime?
+  image         String?
+  username      String     @unique
+  phone         String?
+  passwordHash  String?
+  role          Role       @default(MEMBER)
+  status        UserStatus @default(PENDING)
+  referralCode  String     @unique
+  termsAccepted Boolean    @default(false)
+  lastLoginAt   DateTime?
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  // Genealogy ------------------------------------------------------------
+  sponsorId String?
+  /// Depth in the sponsor tree. 0 = root (no sponsor).
+  depth Int     @default(0)
+  /// Materialized path of user ids including self, dot-wrapped: ".rootId.childId.selfId."
+  /// Subtree lookup: path LIKE ancestor.path || '%'
+  path  String  @default("")
+
+  sponsor   User?  @relation("Sponsorship", fields: [sponsorId], references: [id], onDelete: SetNull)
+  referrals User[] @relation("Sponsorship")
+
+  // Relations ------------------------------------------------------------
+  accounts        Account[]
+  sessions        Session[]
+  profile         Profile?
+  wallet          Wallet?
+  referralsMade   Referral[]      @relation("Referrer")
+  referredBy      Referral?       @relation("Referee")
+  purchases       PackagePurchase[]
+  payments        Payment[]
+  commissionsEarned Commission[]  @relation("CommissionBeneficiary")
+  commissionsSourced Commission[] @relation("CommissionSource")
+  withdrawals     Withdrawal[]
+  deposits        Deposit[]
+  transactions    Transaction[]
+  ledgers         WalletLedger[]
+  kycSubmissions  Kyc[]
+  rank            UserRank?
+  notifications   Notification[]
+  auditLogs       AuditLog[]      @relation("AuditActor")
+  withdrawalsReviewed Withdrawal[] @relation("WithdrawalReviewer")
+  depositsReviewed    Deposit[]    @relation("DepositReviewer")
+  kycReviewed         Kyc[]        @relation("KycReviewer")
+
+  @@index([sponsorId])
+  @@index([depth])
+  @@index([path])
+  @@index([status])
+  @@index([role])
+  @@index([createdAt])
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+model Profile {
+  id          String    @id @default(cuid())
+  userId      String    @unique
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  avatarUrl   String?
+  address     String?
+  country     String?
+  dateOfBirth DateTime?
+  bio         String?   @db.Text
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+}
+
+// ----------------------------------------------------------------------------
+// Referrals
+// ----------------------------------------------------------------------------
+
+/// Immutable record created once, at registration, when a referee joins under
+/// a referrer. The live relationship lives on User.sponsorId (never changed
+/// through the normal UI).
+model Referral {
+  id           String   @id @default(cuid())
+  referrerId   String
+  refereeId    String   @unique
+  referralCode String
+  referrer     User     @relation("Referrer", fields: [referrerId], references: [id], onDelete: Cascade)
+  referee      User     @relation("Referee", fields: [refereeId], references: [id], onDelete: Cascade)
+  createdAt    DateTime @default(now())
+
+  @@index([referrerId, createdAt])
+}
+
+// ----------------------------------------------------------------------------
+// Wallet & financial ledger
+// ----------------------------------------------------------------------------
+
+model Wallet {
+  id              String  @id @default(cuid())
+  userId          String  @unique
+  user            User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  availableBalance Decimal @default(0) @db.Decimal(14, 2)
+  pendingBalance   Decimal @default(0) @db.Decimal(14, 2)
+  totalEarned      Decimal @default(0) @db.Decimal(14, 2)
+  totalWithdrawn   Decimal @default(0) @db.Decimal(14, 2)
+  totalDeposited   Decimal @default(0) @db.Decimal(14, 2)
+  totalCommissions Decimal @default(0) @db.Decimal(14, 2)
+  updatedAt       DateTime @updatedAt
+
+  ledgers WalletLedger[]
+}
+
+/// Immutable ledger event. Every wallet balance change creates exactly one row
+/// per affected balance bucket, recording previous and new balances.
+model WalletLedger {
+  id              String      @id @default(cuid())
+  userId          String
+  user            User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  walletId        String
+  wallet          Wallet      @relation(fields: [walletId], references: [id], onDelete: Cascade)
+  type            LedgerType
+  balanceType     BalanceType @default(AVAILABLE)
+  /// Signed amount: credits positive, debits negative.
+  amount          Decimal     @db.Decimal(14, 2)
+  previousBalance Decimal     @db.Decimal(14, 2)
+  newBalance      Decimal     @db.Decimal(14, 2)
+  description     String
+  /// Domain record id (commission, withdrawal, ...) for traceability.
+  referenceId     String?
+  transactionId   String?
+  transaction     Transaction? @relation(fields: [transactionId], references: [id], onDelete: SetNull)
+  idempotencyKey  String?     @unique
+  createdAt       DateTime    @default(now())
+
+  @@index([userId, createdAt])
+  @@index([transactionId])
+  @@index([type, createdAt])
+}
+
+/// Domain-level financial transaction (purchase, withdrawal, deposit, payout).
+model Transaction {
+  id          String            @id @default(cuid())
+  userId      String
+  user        User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type        TransactionType
+  amount      Decimal           @db.Decimal(14, 2)
+  currency    String            @default("USD")
+  status      TransactionStatus @default(PENDING)
+  description String?
+  referenceId String?
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  ledgers     WalletLedger[]
+  commissions Commission[]
+
+  @@index([userId, createdAt])
+  @@index([status])
+  @@index([type, createdAt])
+}
+
+// ----------------------------------------------------------------------------
+// Packages / products
+// ----------------------------------------------------------------------------
+
+model Package {
+  id                 String    @id @default(cuid())
+  name               String    @unique
+  description        String?   @db.Text
+  price              Decimal   @db.Decimal(14, 2)
+  /// Personal volume points contributed to rank qualification.
+  pv                 Decimal   @default(0) @db.Decimal(14, 2)
+  currency           String    @default("USD")
+  isActive           Boolean   @default(true)
+  commissionEligible Boolean   @default(true)
+  sortOrder          Int       @default(0)
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  purchases PackagePurchase[]
+  payments  Payment[]
+}
+
+model PackagePurchase {
+  id          String         @id @default(cuid())
+  userId      String
+  user        User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  packageId   String
+  package     Package        @relation(fields: [packageId], references: [id], onDelete: Restrict)
+  amount      Decimal        @db.Decimal(14, 2)
+  currency    String         @default("USD")
+  status      PurchaseStatus @default(PENDING)
+  paymentId   String?        @unique
+  payment     Payment?       @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+  /// Source transaction used by the commission engine (unique link).
+  transactionId String?
+  /// Set once commissions have been generated — double-guard against reprocessing.
+  commissionsProcessedAt DateTime?
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  @@index([userId, createdAt])
+  @@index([packageId])
+  @@index([status])
+}
+
+// ----------------------------------------------------------------------------
+// Payments (gateway-agnostic)
+// ----------------------------------------------------------------------------
+
+model Payment {
+  id            String        @id @default(cuid())
+  userId        String
+  user          User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  packageId     String?
+  package       Package?      @relation(fields: [packageId], references: [id], onDelete: SetNull)
+  amount        Decimal       @db.Decimal(14, 2)
+  currency      String        @default("USD")
+  /// Gateway identifier: "manual", "stripe", "bkash", ...
+  gateway       String
+  reference     String        @unique
+  status        PaymentStatus @default(PENDING)
+  metadata      Json?
+  failureReason String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  purchase PackagePurchase?
+
+  @@index([userId, createdAt])
+  @@index([status])
+}
+
+// ----------------------------------------------------------------------------
+// Withdrawals & deposits
+// ----------------------------------------------------------------------------
+
+model Withdrawal {
+  id             String           @id @default(cuid())
+  userId         String
+  user           User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  amount         Decimal          @db.Decimal(14, 2)
+  fee            Decimal          @default(0) @db.Decimal(14, 2)
+  netAmount      Decimal          @db.Decimal(14, 2)
+  currency       String           @default("USD")
+  paymentMethod  String
+  accountDetails String
+  note           String?
+  status         WithdrawalStatus @default(PENDING)
+  /// Wallet debit happens on request (hold); refunds create ledger rows.
+  transactionId  String?
+  reviewedById   String?
+  reviewedBy     User?            @relation("WithdrawalReviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
+  reviewNote     String?
+  reviewedAt     DateTime?
+  completedAt    DateTime?
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+
+  @@index([userId, createdAt])
+  @@index([status])
+}
+
+model Deposit {
+  id           String        @id @default(cuid())
+  userId       String
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  amount       Decimal       @db.Decimal(14, 2)
+  currency     String        @default("USD")
+  method       String
+  reference    String?
+  note         String?
+  status       DepositStatus @default(PENDING)
+  reviewedById String?
+  reviewedBy   User?         @relation("DepositReviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
+  reviewNote   String?
+  reviewedAt   DateTime?
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  @@index([userId, createdAt])
+  @@index([status])
+}
+
+// ----------------------------------------------------------------------------
+// MLM plan configuration
+// ----------------------------------------------------------------------------
+
+/// Singleton row (id = "default") holding all plan-wide settings.
+model MlmSettings {
+  id String @id @default("default")
+
+  /// Compensation plan type. Currently only UNILEVEL is implemented; the
+  /// engine is structured so BINARY / MATRIX can be added later.
+  planType String  @default("UNILEVEL")
+  currency String  @default("USD")
+
+  // Commission ---------------------------------------------------------
+  commissionEnabled     Boolean @default(true)
+  commissionAutoApprove Boolean @default(false)
+  /// Configurable qualification rules:
+  /// { requireActiveMembership, requireKyc, requirePackage,
+  ///   minDirectReferrals, minPersonalVolume, minTeamVolume, minMonthlySales }
+  qualification Json @default("{\"requireActiveMembership\": true, \"requireKyc\": false, \"requirePackage\": true, \"minDirectReferrals\": 0, \"minPersonalVolume\": 0, \"minTeamVolume\": 0, \"minMonthlySales\": 0}")
+
+  // Registration -------------------------------------------------------
+  referralRequired            Boolean @default(false)
+  emailVerificationRequired   Boolean @default(false)
+  phoneVerificationRequired   Boolean @default(false)
+  kycRequiredForActivation    Boolean @default(false)
+  autoActivate                Boolean @default(true)
+  packageRequiredForActivation Boolean @default(false)
+
+  // Withdrawal ---------------------------------------------------------
+  minWithdrawal Decimal @default(10) @db.Decimal(14, 2)
+  maxWithdrawal Decimal @default(5000) @db.Decimal(14, 2)
+  /// Percentage fee (0–100) applied on top of the requested amount.
+  withdrawalFeePercent Decimal @default(0) @db.Decimal(5, 2)
+  withdrawalFeeFixed   Decimal @default(0) @db.Decimal(14, 2)
+  kycRequiredForWithdrawal Boolean @default(true)
+
+  // Misc ---------------------------------------------------------------
+  maintenanceMode Boolean  @default(false)
+  updatedAt       DateTime @updatedAt
+
+  updatedAtHistory DateTime @updatedAt
+}
+
+/// Per-level commission percentages (unilevel plan).
+model CommissionRule {
+  id          String   @id @default(cuid())
+  level       Int      @unique
+  percentage  Decimal  @db.Decimal(5, 2)
+  active      Boolean  @default(true)
+  description String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// ----------------------------------------------------------------------------
+// Commissions
+// ----------------------------------------------------------------------------
+
+model Commission {
+  id                String           @id @default(cuid())
+  beneficiaryId     String
+  beneficiary       User             @relation("CommissionBeneficiary", fields: [beneficiaryId], references: [id], onDelete: Cascade)
+  fromUserId        String
+  fromUser          User             @relation("CommissionSource", fields: [fromUserId], references: [id], onDelete: Cascade)
+  sourceTransactionId String
+  sourceTransaction Transaction      @relation(fields: [sourceTransactionId], references: [id], onDelete: Restrict)
+  level             Int
+  percentage        Decimal          @db.Decimal(5, 2)
+  baseAmount        Decimal          @db.Decimal(14, 2)
+  amount            Decimal          @db.Decimal(14, 2)
+  status            CommissionStatus @default(PENDING)
+  note              String?
+  paidAt            DateTime?
+  reversedAt        DateTime?
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+
+  /// One commission per beneficiary per source transaction — the primary
+  /// duplicate-commission guard. Ledger rows reference commissions via the
+  /// generic WalletLedger.referenceId field (no FK, ledger stays generic).
+  @@unique([sourceTransactionId, beneficiaryId])
+  @@index([beneficiaryId, createdAt])
+  @@index([fromUserId])
+  @@index([status])
+  @@index([level])
+}
+
+// ----------------------------------------------------------------------------
+// KYC
+// ----------------------------------------------------------------------------
+
+model Kyc {
+  id               String    @id @default(cuid())
+  userId           String
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  fullName         String
+  dateOfBirth      DateTime?
+  address          String?
+  documentType     String
+  documentNumber   String
+  /// Private storage keys — never publicly accessible URLs.
+  documentKey      String
+  supportingKey    String?
+  status           KycStatus @default(PENDING)
+  rejectionReason  String?
+  reviewedById     String?
+  reviewedBy       User?     @relation("KycReviewer", fields: [reviewedById], references: [id], onDelete: SetNull)
+  reviewedAt       DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  @@index([userId, createdAt])
+  @@index([status])
+}
+
+// ----------------------------------------------------------------------------
+// Ranks
+// ----------------------------------------------------------------------------
+
+model Rank {
+  id                 String   @id @default(cuid())
+  name               String   @unique
+  /// Ordering level — higher = better rank.
+  level              Int      @unique
+  minDirectReferrals Int      @default(0)
+  minTeamMembers     Int      @default(0)
+  minPersonalVolume  Decimal  @default(0) @db.Decimal(14, 2)
+  minTeamVolume      Decimal  @default(0) @db.Decimal(14, 2)
+  /// One-time bonus credited on achievement.
+  bonus              Decimal  @default(0) @db.Decimal(14, 2)
+  colorHex           String   @default("#6366f1")
+  isActive           Boolean  @default(true)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  holders UserRank[]
+}
+
+model UserRank {
+  id          String   @id @default(cuid())
+  userId      String   @unique
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  rankId      String
+  rank        Rank     @relation(fields: [rankId], references: [id], onDelete: Restrict)
+  achievedAt DateTime @default(now())
+
+  @@index([rankId])
+}
+
+// ----------------------------------------------------------------------------
+// Notifications & audit
+// ----------------------------------------------------------------------------
+
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      NotificationType
+  title     String
+  body      String?          @db.Text
+  link      String?
+  read      Boolean          @default(false)
+  createdAt DateTime         @default(now())
+
+  @@index([userId, read])
+  @@index([userId, createdAt])
+}
+
+model AuditLog {
+  id            String   @id @default(cuid())
+  adminId       String
+  admin         User     @relation("AuditActor", fields: [adminId], references: [id], onDelete: Cascade)
+  action        String
+  targetType    String?
+  targetId      String?
+  previousValue Json?
+  newValue      Json?
+  ip            String?
+  createdAt     DateTime @default(now())
+
+  @@index([adminId, createdAt])
+  @@index([action])
+  @@index([targetType, targetId])
+}
+
+/// Generic key/value system settings (branding, support, feature flags).
+model SystemSetting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+}
