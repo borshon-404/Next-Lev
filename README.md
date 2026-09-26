@@ -169,6 +169,30 @@ Tests run against an **isolated database** (`nexlev_test` by default; override w
 4. **Seed an admin** in production: the first admin should be created through a controlled script (the seed script can be adapted — it skips seeding when an admin already exists). Never ship demo data to production.
 5. Done — the app makes no local-filesystem assumptions at runtime (dev-only KYC storage and dev-only email outbox are explicitly marked as development features).
 
+### Current production setup (as of 2026-09-26)
+
+| Resource | Value |
+| --- | --- |
+| GitHub repo | `github.com/borshon-404/Next-Lev` (branch `main`, auto-deploys to production) |
+| Vercel project | `next-lev` (team `borshon-404`) |
+| Production URL | **https://nexlev-app.vercel.app** |
+| Database | Neon Postgres (Vercel Marketplace integration `neon`, region `iad1`), store `nexlev-db-iad1`. Migrations are applied to the DB directly (see below), so the Vercel build command stays `npm run build` |
+| Env vars on Vercel | `DATABASE_URL` + Neon companion vars (injected by the integration), `AUTH_SECRET`, `AUTH_URL=https://nexlev-app.vercel.app`, `STORAGE_DRIVER=local` |
+
+**Applying migrations & reseeding:** from a machine that can reach the DB,
+`npx vercel env pull .env.prod --environment production`, then
+`DATABASE_URL="$(grep '^DATABASE_URL_UNPOOLED=' .env.prod | cut -d'"' -f2)" npx prisma migrate deploy`
+(the **unpooled** URL is required for Prisma migrations) and, if needed,
+`DATABASE_URL="$(grep '^DATABASE_URL=' .env.prod | cut -d'"' -f2)" npm run db:seed`.
+After changing env vars or the schema, push (even an empty commit) so Vercel rebuilds.
+
+**Known limitations of the current deploy:**
+- `STORAGE_DRIVER=local` → KYC document **uploads fail** on Vercel (read-only filesystem). Set `STORAGE_DRIVER=s3` + `S3_*` vars for full KYC functionality; everything else works.
+- Stripe is not configured → card payments are disabled by design (no fake success); manual payment confirmation by admin works.
+- The DB currently contains the **demo seed** (admin + demo members/transactions, all labeled "Demo …"). To start clean: drop the database in the Neon dashboard, re-run `prisma migrate deploy`, then reseed (or seed only the settings).
+
+**Demo credentials (seeded):** admin `admin@nexlev.test` / `Password123`; members `alice@nexlev.test` … `kim@nexlev.test` / `Password123`.
+
 ## Business model: configurable Unilevel plan
 
 Nothing about the compensation plan is hard-coded. The admin panel (Commission Rules + MLM Settings) stores in the database:
